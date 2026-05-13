@@ -1,0 +1,114 @@
+name: Staging
+
+# Fires on every push to the `staging` branch. Runs the same checks the
+# CI workflow runs, then builds a multi-arch image and pushes it to
+# DockerHub with the `staging` tag.
+#
+# NEXT_PUBLIC_API_URL is baked into the bundle at build time, so the
+# staging deploy needs to know which API it talks to. Set it as a
+# GitHub Actions **variable** named `STAGING_API_URL` on the repo (or in
+# the "staging" environment), or override per-run via workflow_dispatch.
+
+on:
+  push:
+    branches: [staging]
+  workflow_dispatch:
+    inputs:
+      api_url:
+        description: "Override NEXT_PUBLIC_API_URL for this build"
+        required: false
+        type: string
+
+concurrency:
+  group: staging
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  ENVIRONMENT: staging
+
+jobs:
+  test:
+    name: typecheck · build
+    runs-on: ubuntu-latest
+    env:
+      NEXT_PUBLIC_API_URL: http://localhost:8080
+      NEXT_TELEMETRY_DISABLED: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: |
+          if [ -f package-lock.json ]; then
+            npm ci --no-audit --no-fund
+          else
+            npm install --no-audit --no-fund
+          fi
+
+      - run: npm run typecheck
+      - run: npm run build
+
+  publish:
+    name: Publish to DockerHub (staging)
+    needs: test
+    runs-on: ubuntu-latest
+    environment: staging
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify DockerHub credentials are configured
+        run: |
+          if [ -z "${{ secrets.DOCKERHUB_USERNAME }}" ] || [ -z "${{ secrets.DOCKERHUB_TOKEN }}" ]; then
+            echo "::error::Set DOCKERHUB_USERNAME and DOCKERHUB_TOKEN repository secrets."
+            exit 1
+          fi
+
+      - name: Resolve NEXT_PUBLIC_API_URL
+        id: api
+        run: |
+          URL="${{ inputs.api_url }}"
+          if [ -z "$URL" ]; then URL="${{ vars.STAGING_API_URL }}"; fi
+          if [ -z "$URL" ]; then URL="http://localhost:8080"; fi
+          echo "url=$URL" >> "$GITHUB_OUTPUT"
+          echo "Using NEXT_PUBLIC_API_URL=$URL"
+
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ secrets.DOCKERHUB_USERNAME }}/mgm-calendar-frontend
+          tags: |
+            type=raw,value=staging
+            type=sha,format=short,prefix=staging-
+          labels: |
+            org.opencontainers.image.title=mgm-calendar-frontend
+            org.opencontainers.image.description=MGM Laboratory Event Calendar frontend (staging)
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            NEXT_PUBLIC_API_URL=${{ steps.api.outputs.url }}
+          provenance: false
+          cache-from: type=gha,scope=frontend-staging
+          cache-to: type=gha,mode=max,scope=frontend-staging
